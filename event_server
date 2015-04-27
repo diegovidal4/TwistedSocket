@@ -1,0 +1,334 @@
+#!/usr/bin/python
+
+from twisted.enterprise import adbapi
+from twistar.registry import Registry
+from twisted.internet import protocol, reactor, endpoints, threads,defer,task
+from twisted.application import internet,service
+from twisted.python import log
+from twisted.python.logfile import DailyLogFile
+from twistar.registry import Registry
+from models import GpsResponse,Mobile,HistoryGps
+
+import random,sys,time,re,ConfigParser
+import utils
+
+global errors
+global clients
+global commands
+clients=[]
+
+
+
+#Test String: >RXART;2.0.51;ID=356612023066451<
+#Response string: >RSI8956021100034202273;ID=356612023066451<
+#>RER09:QGS;ID=356612023066451<
+class Server(protocol.Protocol):
+	"""
+		Description:
+			- Server class implementation. Control connection parameters and init db notifier for each GPS.
+	"""
+	def __init__(self,db,factory):
+		self.factory=factory
+		#self.db=db
+		self.gps=0
+		self.me_snd=[] #Sent messages
+		self.check_alive=True
+		self.loop_dispatched=0 #Init loop call
+		self.loop_checkAlive=0
+		self.check=True #If is the first check call
+		self.is_connected=False
+		self.get_info=0
+		self.notifier=0 # Each client has a notifier
+		self.listener=0
+	def connectionMade(self):
+		"""
+			Description:
+				- Server response in case of gps connection
+		"""
+		print "Connected %s" % (self.transport.getPeer().host)
+	def connectionLost(self,reason):
+		"""
+			Description:
+				- Server response in case of gps disconnection. 
+				- Remove gps from the client list and stop the notifier
+		"""
+		if self.is_connected:
+			clients.remove(self.gps['mobileId'])
+			log.msg("Disconnected:%s" % (self.gps['mobileId']))
+			log.msg(clients)
+			log.msg("Stopping not dispatched loop")
+			self.loop_dispatched.stop()
+			log.msg("Stopping check alive loop")
+			self.loop_checkAlive.stop()
+
+			
+		log.msg("Disconnected:%s" % (self.transport.getPeer().host))
+		log.msg("Reason:%s" % reason)
+		del self
+	def dataReceived(self, data):
+		"""
+			Description:
+				- Server response in case of data received. 
+				- Init async function to processing  
+		"""
+		resp=utils.get_data(data) #Map data in dict
+		log.msg("Data Received!")
+		print resp
+		if resp: #Correct format
+			if self.is_connected is False: #If isn't connected
+				if resp["command"]=="XART":
+					if 'imei' in resp: #Get IMEI
+						imei=resp["imei"]
+						firm_version=resp["misc"]
+						client_ip=self.transport.getPeer().host
+						gps=self.getGps(imei,firm_version)
+						gps.addCallback(self.getGps_callback)
+							
+					else: #If get IndexError, disconnect
+						log.msg("without IMEI, not gps")
+						self.transport.abortConnection()
+				else:
+					log.msg("Unrecognized connection format")
+					self.transport.abortConnection()
+
+			else: #If gps is connected
+				self.check_alive=True
+				if resp['qualifier']=='R':
+					# if resp['command']=='XART':
+					# 	print "Error:Gps already connected."
+					if resp['command']=='ER':
+						print "Error:"+self.factory.config['Errors'][resp['err_number']]
+					self.receiveMessage(resp)
+				else:
+					print "Incorrect data."
+		else:
+			print "Incorrect data."
+			if self.is_connected:
+				self.check_alive=True
+
+
+			
+		
+	def sendNotDispatched(self): #Send not dispatched commands
+		"""
+			Description:
+				- Dispatch not sent data to the GPS. Return a list of commands to send.
+		"""
+		log.msg("Not dispatched")
+		data=HistoryGps.find(where=[""" "idMobile"=? and dispatched=?""",self.gps['mobileId'],'false'])
+		return data
+
+	def notDispatchedCallback(self,data):
+		""" 
+			Parameters:
+				- data: sendNotDispatched return data.
+			Description:
+				- Print if there is something to send or not.
+		"""
+		if len(data) is not 0:
+			self.sendCommands(data)
+			print "Commands sent"
+		else:
+			print "Nothing to send"
+
+	def sendCommands(self,l):
+		"""
+			Parameters:
+				- l:List of commands to send.
+			Description:
+				- Send commands to the GPS.
+		"""
+		if isinstance(l, list):
+			for msg in l:
+				log.msg("Send:"+msg.data)
+				self.sendMessage(msg.data,msg.id)
+		else:
+			log.msg("Send:"+l.data)
+			self.sendMessage(l.data,i.id)
+
+	def getListenerCallback(self,data):
+		"""
+			Parameters:
+				- data: data returned from notifier
+			Description:
+				- Send data returned from notifier to GPS and check as dispatched in db.
+		"""
+		if data:
+			for d in data:
+				self.sendMessage(d['data'],d['id'])
+		else:
+			print "No data"
+		self.listener=self.notifier.run()
+		self.listener.addCallback(self.getListenerCallback)
+
+
+	def getGps_callback(self,data):
+		"""
+			Description:
+				- Getgps callback.	
+		"""
+		imei=data.imei
+		gpsType=data.gpsType
+		mobile_id=data.id
+		if data is not None:
+			gps={'ip':self.transport.getPeer().host,'imei':imei,'mobileId':mobile_id,'type':gpsType}
+			if gps['mobileId'] not in clients:
+				clients.append(gps['mobileId'])
+				self.gps=gps
+				print clients
+				log.msg("Connected clients:%i" % len(clients))
+				log.msg("new GPS connected, IMEI:"+gps['imei']+", Mobile id:"+str(gps['mobileId']))
+				#Loop call to get not dispatched commands
+				self.loop_dispatched=task.LoopingCall(self.loopNotDispatched)
+				self.loop_dispatched.start(60*3) #Loop call every 3 minutes
+
+				#Loop call to check connection
+				self.loop_checkAlive=task.LoopingCall(self.loopCheckAlive)
+				self.loop_checkAlive.start(60*7)#Loop call every 7 minutes and a half
+
+				self.is_connected=True
+			else:
+				log.msg("GPS already connected")
+				self.transport.abortConnection()
+		else:
+			log.msg("Mobile Id not found") #IMEI not found in db
+			self.transport.abortConnection()
+
+	def loopCheckAlive(self):
+		"""
+			Description:
+				- Init loop that check connection.	
+		"""
+		log.msg("Checking connection")
+		if self.check_alive:
+			log.msg("GPS connected")
+			self.check_alive=False
+		else:
+			log.msg("Gps not connected")
+			self.transport.abortConnection()
+
+	def loopNotDispatched(self):
+		"""
+			Description:
+				- Init loop that check dispatched commands	
+		"""
+		d=self.sendNotDispatched()
+		d.addCallback(self.notDispatchedCallback) #Commands not answered
+
+	def getGps(self,imei,version):
+		"""
+			Parameters:
+				- imei: gps imei.
+				- version: gps firmware version.
+			Description:
+				- Get all the gps data from database.	
+		"""
+		return Mobile.find(where=['imei=?',imei],limit=1)
+		
+
+	def sendMessage(self,data,command_id):
+		"""
+			Parameters:
+				- data: data to send.
+				- command_id: id registered with the command.
+			Description:
+				- Send message to the gps and save it in the message list.	
+		"""
+		data_dict=utils.get_data(data)
+		d=(command_id,data_dict['qualifier'],data_dict['command'],data)
+		if d not in self.me_snd:
+			print "Command to send:"+str(d)
+			self.me_snd.append(d)
+			self.transport.write(data)
+
+	def findAndDelete(self,command):
+		"""
+			Parameters:
+				- command: command to find.
+			Description:
+				- Delete and return the command in the list.	
+		"""
+		aux=[]
+		for msg in self.me_snd:
+			if (msg[1] == 'S' or msg[1] =='Q') and msg[2]==command:
+				data=msg
+				self.me_snd.remove(msg)
+				aux.append(data)
+		print aux
+		return aux
+
+	def receiveMessage(self,data_dict):
+		"""
+			Parameters:
+				- data: Data to send.
+			Description:
+				- Receive the response and search for his answer .	
+		"""
+		if data_dict['command']=="XART": #XART commands are response to XANS
+			data_dict['command']="XANS" 
+
+		print "Data received:"+data_dict['data']
+		if data_dict['command']=="ER":
+			command=data_dict['command_error'][1:]
+		else:
+			command=data_dict['command']
+
+		found=self.findAndDelete(command) #List of commands
+		print "Receive message!"
+		if found:
+			for f in found:
+				print "Response found to:"+f[3]
+				if f[0] is not 0:
+					h=HistoryGps()
+					h.findBy(id=f[0]).addCallback(self.setDispatched,f,command)
+			print self.me_snd
+
+	def setDispatched(self,data,f,response):
+		command=data[0]
+		command.dispatched=True
+		command.save()
+		g=GpsResponse()
+		g.message_id=command.id
+		g.command=f[2]
+		g.data=response
+		g.save()
+
+class ServerFactory(protocol.Factory):
+	"""
+		Description:
+			- Create Server instances for each gps connection.
+	"""
+	def __init__(self,db,config):
+		self.db=db
+		self.clients=[]
+		self.config=config
+	def buildProtocol(self, addr):
+		s=Server(self.db,self)
+		self.clients.append(s)
+		return s
+	def stopFactory(self):
+		self.db.close()
+		log.msg("Connection to db closed")
+		print "Done!"
+
+
+
+if __name__=="__main__":
+	#Load Config File
+	config=ConfigParser.ConfigParser()
+	config.readfp(open('/etc/default/event_server'))
+	config=utils.as_dict(config)
+	#Init logging system
+	if config['Default']['production']=="True":
+		log.startLogging(DailyLogFile.fromFullPath(config['Log']['path']+"/"+config['Log']['filename']))
+	else:
+		log.startLogging(sys.stdout)
+	#Init Database
+	Registry.DBPOOL = adbapi.ConnectionPool('psycopg2', user="gpsweb", password="gpsweb", database="gpsweb",host='190.54.34.35')
+	#db=Database(config['Database']['host'],config['Database']['dbname'],config['Database']['user'],config['Database']['pass'])
+
+	log.msg("Connected to gpsweb")
+	defer.setDebugging(1)
+	#Init socket server
+	endpoints.serverFromString(reactor, "tcp:17180").listen(ServerFactory(Registry.DBPOOL,config))
+	reactor.run()

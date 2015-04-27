@@ -1,0 +1,8 @@
+*.pyc
+tests/multiple_con.py
+client_test_socket.py
+insert_command.py
+notify.py
+RG-NUEVO_REQUERIMIENTO_V3_RU49.xlsx
+.DS_Store
+logs/*
